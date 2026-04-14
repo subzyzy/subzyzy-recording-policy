@@ -5,8 +5,8 @@ if (-not $log) { $log = New-Object System.Collections.Generic.List[string] }
 if (-not $flags) { $flags = 0 }
 
 # ==============================================================================
-#   SUB'S RECORDING POLICY
-#  
+#   SUB'S RECORDING POLICY 
+#   
 # ==============================================================================
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -589,6 +589,64 @@ function Test-SuspiciousIndicator {
 }
 
 
+# --- HIGH-SIGNAL HELPERS ---
+$script:AllowedSignerRegex = [regex]::new('(microsoft|roblox|nvidia|advanced micro devices|amd|intel|corsair|logitech|razer|steelseries|discord|obs project|valve|epic games|google|mozilla)', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+$script:ProtectedTargetRegex = [regex]::new('(RobloxPlayerBeta|RobloxPlayerInstaller|RobloxStudioBeta|dwm|explorer)', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+
+function Test-UserWritablePath {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    $candidates = @(
+        $env:TEMP,
+        $env:TMP,
+        $env:APPDATA,
+        $env:LOCALAPPDATA,
+        (Join-Path $env:USERPROFILE 'Desktop'),
+        (Join-Path $env:USERPROFILE 'Downloads'),
+        (Join-Path $env:USERPROFILE 'Documents')
+    ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    foreach ($root in $candidates) {
+        try {
+            if ($Path.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+        } catch {}
+    }
+    return $false
+}
+
+function Get-FileSignatureInfo {
+    param([string]$Path)
+    $status = 'Unknown'; $signer = ''
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path $Path)) {
+        return [PSCustomObject]@{ Status=$status; Signer=$signer; Allowed=$false }
+    }
+    try {
+        $sig = Get-AuthenticodeSignature -FilePath $Path -ErrorAction SilentlyContinue
+        if ($sig) {
+            $status = [string]$sig.Status
+            try { $signer = [string]$sig.SignerCertificate.Subject } catch { $signer = '' }
+        }
+    } catch {}
+    $allowed = $false
+    if ($status -eq 'Valid' -and -not [string]::IsNullOrWhiteSpace($signer) -and $script:AllowedSignerRegex.IsMatch($signer)) { $allowed = $true }
+    [PSCustomObject]@{ Status=$status; Signer=$signer; Allowed=$allowed }
+}
+
+function Test-ProtectedTarget {
+    param([string]$ImagePathOrName)
+    if ([string]::IsNullOrWhiteSpace($ImagePathOrName)) { return $false }
+    return $script:ProtectedTargetRegex.IsMatch($ImagePathOrName)
+}
+
+function Get-EventMessageField {
+    param([string]$Message,[string]$Name)
+    if ([string]::IsNullOrWhiteSpace($Message) -or [string]::IsNullOrWhiteSpace($Name)) { return $null }
+    foreach ($line in ($Message -split "`r?`n")) {
+        if ($line -match ('^' + [regex]::Escape($Name) + '\s*:\s*(.*)$')) { return $Matches[1].Trim() }
+    }
+    return $null
+}
+
+
 function Test-KnownBenignDllPath {
     param([string]$Path)
     if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
@@ -1095,31 +1153,57 @@ foreach ($proc in (Get-ProcessSnapshotWithUser)) {
 Update-ScanProgress -Percent 38  
 $log.Add("`n[SECTION: DLL INJECTION HEURISTICS]")
 
+$dllFindings = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+$strongSuspiciousDllRegex = [regex]::new('(cheatengine|dbk64|dbk32|synapse|scriptware|jjsploit|wearedevs|fluxus|sirhurt|processhacker|pe-sieve|moneta|manualmap|manual_map|reflective|reflectiveloader|injector|dllinject|hook|executor|exploit|aimbot|triggerbot|wallhack|esp|autohotkey|keyauth|dx9ware|darkdex|infiniteyield|remotespy)', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+$unsignedStatus = @('NotSigned','HashMismatch','NotTrusted','UnknownError')
+
 foreach ($proc in (Get-ProcessSnapshot)) {
     try {
         foreach ($m in $proc.Modules) {
-            $path    = $m.FileName
-            $pathLow = $path.ToLower()
+            $modulePath = $m.FileName
+            $pathLow    = $modulePath.ToLower()
+            $fileName   = [System.IO.Path]::GetFileName($modulePath).ToLower()
 
-            if ($path -match '^[A-Za-z]:\\[^\\]+\.dll$') {
-                if (Test-SuspiciousIndicator $pathLow) {
-                    $log.Add("FAIL: Suspicious DLL at drive root in [$($proc.ProcessName)] -> $path"); $flags++
-                }
-                continue
-            }
+            if ($dllFindings.Contains("$($proc.ProcessName)|$modulePath")) { continue }
 
-            $isUserSpace = $pathLow -match 'appdata|\\temp\\|roaming|\\desktop\\|\\downloads\\|\\documents\\'
-            if ($isUserSpace) {
-                if ((-not (Test-KnownBenignDllPath $pathLow)) -and (Test-SuspiciousIndicator $pathLow)) {
-                    $log.Add("FAIL: Suspicious DLL in user-writable path in [$($proc.ProcessName)] -> $path")
+            $isDriveRoot  = $modulePath -match '^[A-Za-z]:\\[^\\]+\.dll$'
+            $isUserSpace  = $pathLow -match '\\users\\[^\\]+\\(appdata|downloads|desktop|documents)|\\appdata\\|\\temp\\|\\roaming\\'
+            $isSystemLike = ($normalDllRoots | Where-Object { $_ -and $pathLow.StartsWith($_) }).Count -gt 0
+            $nameStrong   = $strongSuspiciousDllRegex.IsMatch($fileName) -or $strongSuspiciousDllRegex.IsMatch($pathLow)
+            $pathWeak     = (Test-SuspiciousIndicator $fileName) -or (Test-SuspiciousIndicator $pathLow)
+
+            if ($isDriveRoot -and ($nameStrong -or $pathWeak)) {
+                if ($dllFindings.Add("$($proc.ProcessName)|$modulePath")) {
+                    $log.Add("FAIL: Suspicious DLL at drive root in [$($proc.ProcessName)] -> $modulePath")
                     $flags++
                 }
                 continue
             }
 
-            if (Test-BlacklistTerm $pathLow) {
-                $log.Add("FAIL: DLL name/path blacklist match in [$($proc.ProcessName)] -> $path")
-                $flags++
+            if ($isUserSpace) {
+                if (Test-KnownBenignDllPath $pathLow) { continue }
+
+                $sigState = $null
+                try { $sigState = (Get-AuthenticodeSignature $modulePath -ErrorAction SilentlyContinue).Status.ToString() } catch {}
+
+                if ($nameStrong -or (($unsignedStatus -contains $sigState) -and $pathWeak)) {
+                    if ($dllFindings.Add("$($proc.ProcessName)|$modulePath")) {
+                        $log.Add("FAIL: Suspicious user-space DLL in [$($proc.ProcessName)] -> $modulePath" + $(if($sigState){" [Sig: $sigState]"}else{""}))
+                        $flags++
+                    }
+                }
+                continue
+            }
+
+            if ((-not $isSystemLike) -and $nameStrong) {
+                $sigState = $null
+                try { $sigState = (Get-AuthenticodeSignature $modulePath -ErrorAction SilentlyContinue).Status.ToString() } catch {}
+                if (($null -eq $sigState) -or ($unsignedStatus -contains $sigState) -or $pathWeak) {
+                    if ($dllFindings.Add("$($proc.ProcessName)|$modulePath")) {
+                        $log.Add("FAIL: Suspicious injected DLL in [$($proc.ProcessName)] -> $modulePath" + $(if($sigState){" [Sig: $sigState]"}else{""}))
+                        $flags++
+                    }
+                }
             }
         }
     } catch {}
@@ -1131,13 +1215,27 @@ if ($robloxProc) {
     try {
         $rbxDir = [System.IO.Path]::GetDirectoryName($robloxProc.MainModule.FileName).ToLower()
         foreach ($m in $robloxProc.Modules) {
-            $mPath = $m.FileName.ToLower()
-            $isSys = ($normalDllRoots | Where-Object { $_ -and $mPath.StartsWith($_) }).Count -gt 0
-            if ($mPath.StartsWith($rbxDir)) { $isSys = $true }
-            if (-not $isSys) {
-                $sig = (Get-AuthenticodeSignature $m.FileName -ErrorAction SilentlyContinue).Status
-                if ($sig -ne "Valid") {
-                    $log.Add("FAIL: Unsigned non-system DLL in Roblox -> $($m.FileName) [Sig: $sig]"); $flags++
+            $mPath    = $m.FileName.ToLower()
+            $fileName = [System.IO.Path]::GetFileName($m.FileName).ToLower()
+            $isKnownRoot = ($normalDllRoots | Where-Object { $_ -and $mPath.StartsWith($_) }).Count -gt 0
+            $isRobloxRoot = $mPath.StartsWith($rbxDir)
+            $nameStrong = $strongSuspiciousDllRegex.IsMatch($fileName) -or $strongSuspiciousDllRegex.IsMatch($mPath)
+
+            if ($isRobloxRoot) { continue }
+
+            if (-not $isKnownRoot) {
+                $sigState = $null
+                $signer   = ''
+                try {
+                    $sigObj = Get-AuthenticodeSignature $m.FileName -ErrorAction SilentlyContinue
+                    $sigState = $sigObj.Status.ToString()
+                    if ($sigObj.SignerCertificate) { $signer = $sigObj.SignerCertificate.Subject }
+                } catch {}
+
+                $badSigner = $signer -and ($signer -notmatch 'Microsoft|Roblox|NVIDIA|AMD|Intel')
+                if ($nameStrong -or ($unsignedStatus -contains $sigState) -or $badSigner) {
+                    $log.Add("FAIL: Suspicious non-system DLL in Roblox -> $($m.FileName)" + $(if($sigState){" [Sig: $sigState]"}else{""}) + $(if($signer){" [Signer: $signer]"}else{""}))
+                    $flags++
                 }
             }
         }
@@ -1580,20 +1678,20 @@ $log.Add("INFO: Temp folder forensics complete.")
 
 
 # ==============================================================================
-#   BAM ENTRIES (BACKGROUND — non-blocking GridView + log entries)
+#   BAM ENTRIES (collect now, show PAH near end)
 # ==============================================================================
 Update-ScanProgress -Percent 68 
 $log.Add("`n[SECTION: BAM EXECUTION HISTORY]")
 
-# Collect BAM entries and log flagged ones now, then open GridView in background
-$bamBlacklist = $cheatBlacklist
+$script:BamPahData = @()
 try {
     $bamRootPaths = @(
         "HKLM:\SYSTEM\CurrentControlSet\Services\bam\UserSettings",
         "HKLM:\SYSTEM\CurrentControlSet\Services\bam\State\UserSettings"
     ) | Where-Object { Test-Path $_ }
 
-    $bamEntries = @()
+    $bamEntries = New-Object System.Collections.Generic.List[object]
+    $bamSeen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 
     foreach ($root in $bamRootPaths) {
         foreach ($userKey in (Get-ChildItem -Path $root -ErrorAction SilentlyContinue)) {
@@ -1611,51 +1709,45 @@ try {
                     $safeTime = Get-SafeBamTime -Data $raw
                     if ($null -eq $safeTime) { continue }
 
-                    $exeFile  = Split-Path -Leaf $valueName
-                    $fullPath = Convert-DevicePathToDrivePath $valueName
-                    $timeLocal = $safeTime.ToString("yyyy-MM-dd HH:mm:ss")
+                    $exeFile   = Split-Path -Leaf $valueName
+                    $fullPath  = Convert-DevicePathToDrivePath $valueName
+                    $timeLocal = $safeTime.ToLocalTime()
+                    $rowKey    = "{0}|{1}|{2}" -f $user, $fullPath, $timeLocal.ToString('o')
+                    if (-not $bamSeen.Add($rowKey)) { continue }
 
                     if (Test-BlacklistTerm "$exeFile $fullPath") {
-                        $script:log.Add("FAIL: BAM entry blacklist match -> $exeFile | Path: $fullPath | Last Run: $timeLocal | User: $user")
+                        $script:log.Add("FAIL: BAM entry blacklist match -> $exeFile | Path: $fullPath | Last Run: $($timeLocal.ToString('yyyy-MM-dd HH:mm:ss')) | User: $user")
                         $script:flags++
                     }
 
-                    $log.Add("BAM: $exeFile | Last Run: $timeLocal | User: $user | Path: $fullPath")
+                    $log.Add("BAM: $exeFile | Last Run: $($timeLocal.ToString('yyyy-MM-dd HH:mm:ss')) | User: $user | Path: $fullPath")
 
                     $sig = ""
                     if ($fullPath -and (Test-Path $fullPath)) {
                         try { $sig = (Get-AuthenticodeSignature $fullPath -ErrorAction SilentlyContinue).Status } catch {}
                     }
 
-                    $bamEntries += [PSCustomObject]@{
-                        "Last Run (Local)" = $timeLocal
-                        "Executable"       = $exeFile
-                        "Full Path"        = $fullPath
-                        "Signature"        = $sig
-                        "User"             = $user
-                    }
+                    $bamEntries.Add([PSCustomObject]@{
+                        SortTime            = $timeLocal
+                        "Last Run (Local)" = $timeLocal.ToString('yyyy-MM-dd HH:mm:ss')
+                        "Executable"        = $exeFile
+                        "Full Path"         = $fullPath
+                        "Signature"         = $sig
+                        "User"              = $user
+                    }) | Out-Null
                 }
             } catch {}
         }
     }
 
     if ($bamEntries.Count -gt 0) {
-        $bamData = $bamEntries |
-            Sort-Object @{ Expression = { try { [datetime]$_."Last Run (Local)" } catch { [datetime]::MinValue } }; Descending = $true }, Executable |
-            Group-Object Executable, "Full Path", "Last Run (Local)", User |
-            ForEach-Object { $_.Group[0] }
-
-        if (-not (Start-PAHWindow -Data $bamData)) {
-            $log.Add("INFO: PAH window could not be opened.")
-        }
+        $script:BamPahData = @($bamEntries | Sort-Object SortTime -Descending | Select-Object "Last Run (Local)","Executable","Full Path","Signature","User")
     } else {
         $log.Add("INFO: No valid BAM execution entries found.")
     }
 } catch {
     $log.Add("INFO: BAM scan error — $($_.Exception.Message)")
 }
-
-
 
 # ==============================================================================
 #   REAL-TIME PROCESS MONITORING (single snapshot)
@@ -2047,51 +2139,102 @@ function Search-FirefoxHistory {
     }
 }
 
+function Test-BrowserActuallyUsed {
+    param(
+        [string]$ProcessName,
+        [string[]]$HistoryFiles
+    )
+    try {
+        if ($ProcessName -and (Get-Process -Name $ProcessName -ErrorAction SilentlyContinue | Select-Object -First 1)) { return $true }
+    } catch {}
+    foreach ($hf in $HistoryFiles) {
+        if ($hf -and (Test-Path $hf)) {
+            try {
+                $item = Get-Item $hf -ErrorAction Stop
+                if ($item.Length -gt 0 -and $item.LastWriteTime -gt (Get-Date).AddDays(-120)) { return $true }
+            } catch {}
+        }
+    }
+    return $false
+}
+
+$scannedBrowserLabels = New-Object System.Collections.Generic.List[string]
+
 # Chrome (all profiles)
 $chromePath = "$env:LOCALAPPDATA\Google\Chrome\User Data"
 if (Test-Path $chromePath) {
-    Get-ChildItem $chromePath -Directory -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -eq "Default" -or $_.Name -match "^Profile \d+$" } |
-        ForEach-Object { Search-ChromiumHistory -BrowserName "Chrome ($($_.Name))" -HistoryPath (Join-Path $_.FullName "History") }
-} else { $log.Add("INFO: Chrome not installed or profile not found.") }
+    $chromeProfiles = @(Get-ChildItem $chromePath -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq "Default" -or $_.Name -match "^Profile \d+$" })
+    $chromeHistories = @($chromeProfiles | ForEach-Object { Join-Path $_.FullName "History" })
+    if (Test-BrowserActuallyUsed -ProcessName 'chrome' -HistoryFiles $chromeHistories) {
+        foreach ($profile in $chromeProfiles) { Search-ChromiumHistory -BrowserName "Chrome ($($profile.Name))" -HistoryPath (Join-Path $profile.FullName "History") }
+        $scannedBrowserLabels.Add('Chrome') | Out-Null
+    }
+}
 
 # Edge (all profiles)
 $edgePath = "$env:LOCALAPPDATA\Microsoft\Edge\User Data"
 if (Test-Path $edgePath) {
-    Get-ChildItem $edgePath -Directory -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -eq "Default" -or $_.Name -match "^Profile \d+$" } |
-        ForEach-Object { Search-ChromiumHistory -BrowserName "Edge ($($_.Name))" -HistoryPath (Join-Path $_.FullName "History") }
-} else { $log.Add("INFO: Edge not installed or profile not found.") }
+    $edgeProfiles = @(Get-ChildItem $edgePath -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq "Default" -or $_.Name -match "^Profile \d+$" })
+    $edgeHistories = @($edgeProfiles | ForEach-Object { Join-Path $_.FullName "History" })
+    if (Test-BrowserActuallyUsed -ProcessName 'msedge' -HistoryFiles $edgeHistories) {
+        foreach ($profile in $edgeProfiles) { Search-ChromiumHistory -BrowserName "Edge ($($profile.Name))" -HistoryPath (Join-Path $profile.FullName "History") }
+        $scannedBrowserLabels.Add('Edge') | Out-Null
+    }
+}
 
 # Brave
 $bravePath = "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\User Data"
 if (Test-Path $bravePath) {
-    Get-ChildItem $bravePath -Directory -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -eq "Default" -or $_.Name -match "^Profile \d+$" } |
-        ForEach-Object { Search-ChromiumHistory -BrowserName "Brave ($($_.Name))" -HistoryPath (Join-Path $_.FullName "History") }
-} else { $log.Add("INFO: Brave not installed or profile not found.") }
+    $braveProfiles = @(Get-ChildItem $bravePath -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq "Default" -or $_.Name -match "^Profile \d+$" })
+    $braveHistories = @($braveProfiles | ForEach-Object { Join-Path $_.FullName "History" })
+    if (Test-BrowserActuallyUsed -ProcessName 'brave' -HistoryFiles $braveHistories) {
+        foreach ($profile in $braveProfiles) { Search-ChromiumHistory -BrowserName "Brave ($($profile.Name))" -HistoryPath (Join-Path $profile.FullName "History") }
+        $scannedBrowserLabels.Add('Brave') | Out-Null
+    }
+}
 
 # Opera / Opera GX
-foreach ($opPath in @("$env:APPDATA\Opera Software\Opera Stable","$env:APPDATA\Opera Software\Opera GX Stable")) {
-    if (Test-Path $opPath) {
-        Search-ChromiumHistory -BrowserName "Opera ($(Split-Path $opPath -Leaf))" -HistoryPath (Join-Path $opPath "History")
+$operaEntries = @(
+    @{ Label = 'Opera Stable'; Process='opera'; Path="$env:APPDATA\Opera Software\Opera Stable" },
+    @{ Label = 'Opera GX'; Process='opera'; Path="$env:APPDATA\Opera Software\Opera GX Stable" }
+)
+foreach ($op in $operaEntries) {
+    if (Test-Path $op.Path) {
+        $historyPath = Join-Path $op.Path 'History'
+        if (Test-BrowserActuallyUsed -ProcessName $op.Process -HistoryFiles @($historyPath)) {
+            Search-ChromiumHistory -BrowserName $op.Label -HistoryPath $historyPath
+            $scannedBrowserLabels.Add($op.Label) | Out-Null
+        }
     }
 }
 
 # Vivaldi
 $vivaldiPath = "$env:LOCALAPPDATA\Vivaldi\User Data"
 if (Test-Path $vivaldiPath) {
-    Get-ChildItem $vivaldiPath -Directory -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -eq "Default" -or $_.Name -match "^Profile \d+$" } |
-        ForEach-Object { Search-ChromiumHistory -BrowserName "Vivaldi ($($_.Name))" -HistoryPath (Join-Path $_.FullName "History") }
+    $vivaldiProfiles = @(Get-ChildItem $vivaldiPath -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq "Default" -or $_.Name -match "^Profile \d+$" })
+    $vivaldiHistories = @($vivaldiProfiles | ForEach-Object { Join-Path $_.FullName "History" })
+    if (Test-BrowserActuallyUsed -ProcessName 'vivaldi' -HistoryFiles $vivaldiHistories) {
+        foreach ($profile in $vivaldiProfiles) { Search-ChromiumHistory -BrowserName "Vivaldi ($($profile.Name))" -HistoryPath (Join-Path $profile.FullName "History") }
+        $scannedBrowserLabels.Add('Vivaldi') | Out-Null
+    }
 }
 
 # Firefox (all profiles)
 $ffBase = "$env:APPDATA\Mozilla\Firefox\Profiles"
 if (Test-Path $ffBase) {
-    Get-ChildItem $ffBase -Directory -ErrorAction SilentlyContinue |
-        ForEach-Object { Search-FirefoxHistory -ProfilePath $_.FullName }
-} else { $log.Add("INFO: Firefox not installed or profile not found.") }
+    $ffProfiles = @(Get-ChildItem $ffBase -Directory -ErrorAction SilentlyContinue)
+    $ffHistories = @($ffProfiles | ForEach-Object { Join-Path $_.FullName 'places.sqlite' })
+    if (Test-BrowserActuallyUsed -ProcessName 'firefox' -HistoryFiles $ffHistories) {
+        foreach ($profile in $ffProfiles) { Search-FirefoxHistory -ProfilePath $profile.FullName }
+        $scannedBrowserLabels.Add('Firefox') | Out-Null
+    }
+}
+
+if ($scannedBrowserLabels.Count -gt 0) {
+    $log.Add("INFO: Browser history scanned for active/used browsers only -> $($scannedBrowserLabels -join ', ')")
+} else {
+    $log.Add("INFO: No active/used browser profiles met the scan criteria.")
+}
 
 # Also check browser typed URLs in registry
 $typedUrlKey = "HKCU:\Software\Microsoft\Internet Explorer\TypedURLs"
@@ -2145,7 +2288,7 @@ foreach ($exKey in $exclRegKeys) {
     }
 }
 
-# --- File scan: 
+# --- File scan: scripts in user paths that contain Defender bypass commands ---
 $bypassScriptPaths = @("$env:USERPROFILE\Desktop","$env:USERPROFILE\Downloads","$env:USERPROFILE\Documents","$env:APPDATA","$env:TEMP")
 $bypassExts = @("*.ps1","*.bat","*.cmd","*.vbs")
 $bypassTerms = @("Set-MpPreference","Add-MpPreference","DisableRealtimeMonitoring","ExclusionPath","DisableBehaviorMonitoring","Add-MpPreference -ExclusionPath")
@@ -2499,28 +2642,46 @@ function Send-AuditWebhook {
         [string]$UserName
     )
 
-    $colour = if ($FlagCount -gt 0) { 15158332 } else { 3066993 }
-    $status = if ($FlagCount -gt 0) { ":warning: FLAGGED ($FlagCount flags)" } else { ":white_check_mark: CLEAN" }
+    $colour      = if ($FlagCount -gt 0) { 15158332 } else { 5763719 }
+    $statusEmoji = if ($FlagCount -gt 0) { "⚠️" } else { "✅" }
+    $statusText  = if ($FlagCount -gt 0) { "Flagged" } else { "Clean" }
+    $statusLine  = if ($FlagCount -gt 0) { "⚠️ **Flagged scan** with **$FlagCount** issue(s) found." } else { "✅ **Clean scan** with no flags found." }
+    $scanTime    = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $fileName    = [System.IO.Path]::GetFileName($LogFilePath)
+    $logLines    = 0
+    try { $logLines = (Get-Content -LiteralPath $LogFilePath -ErrorAction Stop | Measure-Object -Line).Lines } catch {}
+
     $payloadJson = [PSCustomObject]@{
-        embeds = @(
+        username   = "SubRec Policy"
+        avatar_url = "https://cdn.discordapp.com/embed/avatars/0.png"
+        embeds     = @(
             [PSCustomObject]@{
-                title       = "Sub's Recording Policy — Audit Report"
-                description = "System integrity scan complete."
+                title       = "🛡️ Sub's Recording Policy Report"
+                description = "$statusLine`n`n📎 Full audit report attached below."
                 color       = $colour
                 fields      = @(
-                    [PSCustomObject]@{ name = "PC Name";   value = $MachineName; inline = $true  }
-                    [PSCustomObject]@{ name = "User";      value = $UserName;    inline = $true  }
-                    [PSCustomObject]@{ name = "Result";    value = $status;      inline = $false }
-                    [PSCustomObject]@{ name = "Scan Time"; value = (Get-Date -Format "yyyy-MM-dd HH:mm:ss"); inline = $false }
+                    [PSCustomObject]@{ name = "💻 PC";           value = if ($MachineName) { $MachineName } else { "Unknown" }; inline = $true  }
+                    [PSCustomObject]@{ name = "👤 User";         value = if ($UserName) { $UserName } else { "Unknown" }; inline = $true  }
+                    [PSCustomObject]@{ name = "📌 Result";       value = "$statusEmoji $statusText"; inline = $true  }
+                    [PSCustomObject]@{ name = "🚩 Flags";        value = "$FlagCount"; inline = $true  }
+                    [PSCustomObject]@{ name = "📝 Log Lines";    value = "$logLines"; inline = $true  }
+                    [PSCustomObject]@{ name = "🕒 Scan Time";    value = $scanTime; inline = $true  }
+                    [PSCustomObject]@{ name = "📄 Attachment";   value = $fileName; inline = $false }
                 )
-                footer = [PSCustomObject]@{ text = "Sub's Recording Policy v5.1" }
+                footer = [PSCustomObject]@{ text = "Sub's Recording Policy • v5.1" }
+                timestamp = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
             }
         )
-    } | ConvertTo-Json -Depth 10 -Compress
+        attachments = @(
+            [PSCustomObject]@{
+                id = 0
+                filename = $fileName
+            }
+        )
+    } | ConvertTo-Json -Depth 12 -Compress
 
     try {
         $fileBytes = [System.IO.File]::ReadAllBytes($LogFilePath)
-        $fileName  = [System.IO.Path]::GetFileName($LogFilePath)
         $boundary  = [System.Guid]::NewGuid().ToString('N')
         $CRLF      = "`r`n"
 
@@ -2555,16 +2716,109 @@ function Compress-LogLines {
     param([System.Collections.Generic.List[string]]$Lines)
     $result = New-Object System.Collections.Generic.List[string]
     $last = $null
+    $blankStreak = 0
     foreach ($line in $Lines) {
-        if ($null -ne $last -and $line -eq $last) { continue }
-        $result.Add($line) | Out-Null
-        $last = $line
+        $normalized = if ($null -eq $line) { "" } else { [string]$line }
+        if ([string]::IsNullOrWhiteSpace($normalized)) {
+            $blankStreak++
+            if ($blankStreak -gt 1) { continue }
+        } else {
+            $blankStreak = 0
+        }
+        if ($null -ne $last -and $normalized -eq $last) { continue }
+        $result.Add($normalized) | Out-Null
+        $last = $normalized
     }
     return $result
 }
 
+function Shorten-DisplayPath {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $Path }
+    $p = $Path
+    foreach ($root in @($env:USERPROFILE, $env:LOCALAPPDATA, $env:APPDATA, $env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:SystemRoot)) {
+        if ($root -and $p.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return ('...' + $p.Substring($root.Length))
+        }
+    }
+    return $p
+}
+
+function Show-PAHWindow {
+    $launcherPath = Join-Path $env:TEMP ("subrec_pah_{0}.ps1" -f ([Guid]::NewGuid().ToString('N')))
+    try {
+        $launcher = @"
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+function Show-ProcessActiveHistory {
+    `$form = New-Object Windows.Forms.Form
+    `$form.Text = "Process Active History"
+    `$form.WindowState = 'Maximized'
+    `$form.MinimumSize = New-Object Drawing.Size(800, 600)
+    `$form.StartPosition = "CenterScreen"
+    `$form.BackColor = [Drawing.Color]::White
+    `$form.Topmost = `$true
+
+    `$listBox = New-Object Windows.Forms.ListBox
+    `$listBox.Dock = 'Fill'
+    `$listBox.Font = New-Object Drawing.Font("Consolas", 10)
+    `$listBox.BackColor = [Drawing.Color]::White
+    `$listBox.ForeColor = [Drawing.Color]::Black
+    `$form.Controls.Add(`$listBox)
+
+    `$seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    try {
+        foreach (`$p in (Get-Process | Where-Object { `$_.MainWindowTitle -or `$_.ProcessName })) {
+            if (`$p.ProcessName -and -not `$seen.Contains(`$p.ProcessName)) {
+                [void]`$seen.Add(`$p.ProcessName)
+                `$stamp = Get-Date -Format "HH:mm:ss"
+                [void]`$listBox.Items.Add("[`$stamp] Opened: `$(`$p.ProcessName)")
+            }
+        }
+    } catch {}
+
+    `$timer = New-Object Windows.Forms.Timer
+    `$timer.Interval = 2000
+    `$timer.Add_Tick({
+        try {
+            `$procs = Get-Process | Where-Object { `$_.MainWindowTitle -or `$_.ProcessName }
+            foreach (`$p in `$procs) {
+                `$name = `$p.ProcessName
+                if (`$name -and -not `$seen.Contains(`$name)) {
+                    [void]`$seen.Add(`$name)
+                    `$stamp = Get-Date -Format "HH:mm:ss"
+                    [void]`$listBox.Items.Add("[`$stamp] Opened: `$name")
+                }
+            }
+        } catch {}
+    })
+    `$timer.Start()
+    `$form.Add_Shown({ `$form.Activate() })
+    `$form.Add_FormClosing({ `$timer.Stop(); `$timer.Dispose() })
+    [void] `$form.ShowDialog()
+}
+
+Show-ProcessActiveHistory
+Remove-Item -LiteralPath '$launcherPath' -Force -ErrorAction SilentlyContinue
+"@
+        Set-Content -Path $launcherPath -Value $launcher -Encoding UTF8 -Force
+        $pwsh = (Get-Command powershell.exe -ErrorAction SilentlyContinue | Select-Object -First 1).Source
+        if (-not $pwsh) { $pwsh = (Get-Command pwsh.exe -ErrorAction SilentlyContinue | Select-Object -First 1).Source }
+        if ($pwsh) {
+            Start-Process -FilePath $pwsh -ArgumentList @('-NoLogo','-NoProfile','-ExecutionPolicy','Bypass','-STA','-File', $launcherPath) -WindowStyle Normal | Out-Null
+            $log.Add("INFO: PAH launched near end of scan.")
+        } else {
+            $log.Add("INFO: PAH skipped — no PowerShell host found.")
+        }
+    } catch {
+        $log.Add("INFO: PAH failed to launch — $($_.Exception.Message)")
+    }
+}
+
 # ==============================================================================
 #   FINAL SUMMARY + LOG WRITE + WEBHOOK
+# ==============================================================================
 # ==============================================================================
 $log.Add("`n[SUMMARY]")
 $log.Add("PC Name       : $($env:COMPUTERNAME)")
@@ -2577,72 +2831,6 @@ $log.Add("Total Flags   : $flags")
 Update-ScanProgress -Percent 96
 $log.Add("`n[SECTION: PUBLIC FORENSIC HEURISTICS]")
 
-
-function Start-PAHWindow {
-    param(
-        [Parameter(Mandatory=$true)]
-        [object[]]$Data
-    )
-
-    try {
-        if (-not $Data -or $Data.Count -eq 0) { return $false }
-
-        $ogvCmd = Get-Command Out-GridView -ErrorAction SilentlyContinue
-        if (-not $ogvCmd) {
-            $script:log.Add("INFO: PAH window skipped - Out-GridView is not available on this system.")
-            return $false
-        }
-
-        $pahDataPath = Join-Path $env:TEMP ("SubRec_PAH_{0}.clixml" -f ([guid]::NewGuid().ToString("N")))
-        $pahScriptPath = Join-Path $env:TEMP ("SubRec_PAH_{0}.ps1" -f ([guid]::NewGuid().ToString("N")))
-
-        $Data | Export-Clixml -Path $pahDataPath -Force
-
-        $pahScript = @"
-param([string]`$DataPath)
-try {
-    Add-Type -AssemblyName PresentationFramework -ErrorAction SilentlyContinue | Out-Null
-} catch {}
-try {
-    `$rows = Import-Clixml -Path `$DataPath
-    if (`$rows) {
-        `$rows | Out-GridView -Title 'PAH (Process Activity History)'
-    }
-} finally {
-    Start-Sleep -Milliseconds 250
-    Remove-Item -LiteralPath `$DataPath -Force -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath `$PSCommandPath -Force -ErrorAction SilentlyContinue
-}
-"@
-        Set-Content -LiteralPath $pahScriptPath -Value $pahScript -Encoding UTF8 -Force
-
-        $psExe = if (Test-Path "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe") {
-            "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
-        } else {
-            (Get-Command powershell.exe -ErrorAction SilentlyContinue).Source
-        }
-
-        if (-not $psExe) {
-            $script:log.Add("INFO: PAH window skipped - Windows PowerShell was not found.")
-            return $false
-        }
-
-        Start-Process -FilePath $psExe -ArgumentList @(
-            '-NoProfile',
-            '-ExecutionPolicy','Bypass',
-            '-STA',
-            '-File', $pahScriptPath,
-            '-DataPath', $pahDataPath
-        ) -WindowStyle Normal | Out-Null
-
-        $script:log.Add("INFO: PAH window launched.")
-        return $true
-    } catch {
-        $script:log.Add("INFO: PAH window launch failed - $($_.Exception.Message)")
-        return $false
-    }
-}
-
 function Test-HiddenOrUnicodeName {
     param([string]$Text)
     if ([string]::IsNullOrWhiteSpace($Text)) { return $false }
@@ -2652,32 +2840,83 @@ function Test-HiddenOrUnicodeName {
 # Suspicious URL protocols / shell handlers
 try {
     $protocolRoots = @("HKCU:\Software\Classes", "HKLM:\SOFTWARE\Classes")
-    $protocolFlagged = $false
+    $checkedHandlers = 0
+    $suspiciousHandlers = New-Object System.Collections.Generic.List[object]
+    $userWritableHandlers = New-Object System.Collections.Generic.List[object]
+
+    $knownBenignProtocols = @(
+        'discord','discord-562286213059444737','roblox','roblox-player','roblox-studio','roblox-studio-auth',
+        'zoommtg','zoomus','zoommeeting.sip','zoomphonecall','zoompbx.im','zoompbx.zoomphonecall',
+        'tg','tonsite','telegram','spotify','vscode','cursor','cursor-insiders','opera','operastable',
+        'odopen','grvopen','msonedrivesyncserviceclient','onedrive','medal','modrinth','lunarclient',
+        'framer-app','proton-inbox','wispr-flow','bstsrvs','capcut'
+    )
+
     foreach ($root in $protocolRoots) {
         if (-not (Test-Path $root)) { continue }
         foreach ($sub in (Get-ChildItem $root -ErrorAction SilentlyContinue)) {
             try {
+                $scheme = $sub.PSChildName
+                if ([string]::IsNullOrWhiteSpace($scheme)) { continue }
+                if ($scheme -eq '*' -or $scheme.StartsWith('.')) { continue }
+                if ($scheme -notmatch '^[a-zA-Z][a-zA-Z0-9+\-\.]{1,80}$') { continue }
+
                 $keyPath = $sub.PSPath
                 $hasProtocol = $null -ne (Get-ItemProperty -Path $keyPath -Name "URL Protocol" -ErrorAction SilentlyContinue)."URL Protocol"
                 if (-not $hasProtocol) { continue }
 
                 $cmdKey = Join-Path $sub.PSPath "shell\open\command"
-                $cmd    = (Get-ItemProperty -Path $cmdKey -ErrorAction SilentlyContinue)."(default)"
+                $cmd = (Get-ItemProperty -Path $cmdKey -ErrorAction SilentlyContinue)."(default)"
                 if ([string]::IsNullOrWhiteSpace($cmd)) { continue }
+                $checkedHandlers++
 
-                if (Test-SuspiciousIndicator $cmd) {
-                    $log.Add("FAIL: Suspicious URL protocol handler -> $($sub.PSChildName) | $cmd")
-                    $flags++; $protocolFlagged = $true
+                $isUserWritable = $cmd -imatch 'appdata|\\temp\\|\\users\\[^\\]+\\downloads\\|\\users\\[^\\]+\\desktop\\'
+                $isBenignScheme = $knownBenignProtocols -contains $scheme.ToLower()
+                $hasCheatSignal = Test-BlacklistTerm "$scheme $cmd"
+
+                if ($hasCheatSignal) {
+                    $suspiciousHandlers.Add([pscustomobject]@{
+                        Scheme = $scheme
+                        Command = $cmd
+                    }) | Out-Null
+                    $flags++
                     continue
                 }
 
-                if ($cmd -imatch 'appdata|\\temp\\|\\users\\[^\\]+\\downloads\\|\\users\\[^\\]+\\desktop\\') {
-                    $log.Add("WARN: URL protocol launches from user-writable path -> $($sub.PSChildName) | $cmd")
+                if ($isUserWritable -and -not $isBenignScheme) {
+                    $userWritableHandlers.Add([pscustomobject]@{
+                        Scheme = $scheme
+                        Command = $cmd
+                    }) | Out-Null
                 }
             } catch {}
         }
     }
-    if (-not $protocolFlagged) { $log.Add("PASS: No suspicious URL protocol handlers detected.") }
+
+    $log.Add("INFO: Checked $checkedHandlers URL protocol handlers.")
+    if ($userWritableHandlers.Count -gt 0) {
+        $log.Add("WARN: $($userWritableHandlers.Count) protocol handler(s) launch from user-writable paths.")
+        foreach ($item in ($userWritableHandlers | Sort-Object Scheme -Unique | Select-Object -First 8)) {
+            $log.Add("  - $($item.Scheme) -> $(Shorten-DisplayPath $item.Command)")
+        }
+        if ($userWritableHandlers.Count -gt 8) {
+            $log.Add("  - ... plus $($userWritableHandlers.Count - 8) more")
+        }
+    } else {
+        $log.Add("PASS: No unexpected user-writable URL protocol handlers.")
+    }
+
+    if ($suspiciousHandlers.Count -gt 0) {
+        $log.Add("FAIL: $($suspiciousHandlers.Count) suspicious URL protocol handler(s) detected.")
+        foreach ($item in ($suspiciousHandlers | Sort-Object Scheme -Unique | Select-Object -First 8)) {
+            $log.Add("  - $($item.Scheme) -> $(Shorten-DisplayPath $item.Command)")
+        }
+        if ($suspiciousHandlers.Count -gt 8) {
+            $log.Add("  - ... plus $($suspiciousHandlers.Count - 8) more")
+        }
+    } else {
+        $log.Add("PASS: No suspicious URL protocol handlers detected.")
+    }
 } catch { $log.Add("INFO: URL protocol scan skipped.") }
 
 # Prefetch tamper / disabled checks
@@ -2728,17 +2967,29 @@ try {
         "$env:LOCALAPPDATA"
     ) | Where-Object { $_ -and (Test-Path $_) }
 
-    $hiddenCharFlagged = $false
+    $hiddenCharHits = New-Object System.Collections.Generic.List[string]
     foreach ($root in $candidateRoots) {
         foreach ($f in (Get-ChildItem $root -File -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.Extension -match '\.(exe|dll|sys|bat|cmd|ps1|vbs|js|jar|lnk)$' })) {
             $candidateText = "$($f.Name) $($f.FullName)"
             if (Test-HiddenOrUnicodeName $f.Name -and (Test-BlacklistTerm $candidateText)) {
-                $log.Add("FAIL: Hidden-character blacklisted file name detected -> $($f.FullName)")
-                $flags++; $hiddenCharFlagged = $true
+                $hiddenCharHits.Add($f.FullName) | Out-Null
+                $flags++
             }
         }
     }
-    if (-not $hiddenCharFlagged) { $log.Add("PASS: No hidden-character blacklisted file names detected.") }
+    if ($hiddenCharHits.Count -gt 0) {
+        $uniqueHidden = $hiddenCharHits | Sort-Object -Unique
+        $log.Add("FAIL: $($uniqueHidden.Count) hidden-character blacklisted file name(s) detected.")
+        foreach ($path in ($uniqueHidden | Select-Object -First 8)) {
+            $cleanName = ([regex]::Replace((Split-Path $path -Leaf), '[\x00-\x1F\x7F\u200B-\u200F\u202A-\u202E\u2060\uFEFF]', ''))
+            $log.Add("  - $(Shorten-DisplayPath $path) [displayed as: $cleanName]")
+        }
+        if ($uniqueHidden.Count -gt 8) {
+            $log.Add("  - ... plus $($uniqueHidden.Count - 8) more")
+        }
+    } else {
+        $log.Add("PASS: No hidden-character blacklisted file names detected.")
+    }
 } catch { $log.Add("INFO: Hidden-character filename scan skipped.") }
 
 # Expanded PowerShell history review for bypass / cleaner / artifact tamper commands
@@ -2755,11 +3006,170 @@ try {
     }
 } catch { $log.Add("INFO: Extended PowerShell history review skipped.") }
 
+
+
+# ==============================================================================
+#   SECTION: HIGH-SIGNAL TELEMETRY CORRELATION
+# ==============================================================================
+$log.Add("`n[SECTION: HIGH-SIGNAL TELEMETRY CORRELATION]")
+try {
+    if (Get-WinEvent -ListLog 'Microsoft-Windows-Sysmon/Operational' -ErrorAction SilentlyContinue) {
+        $now = Get-Date
+        $windowStart = $now.AddDays(-7)
+        $sysmonFailCount = 0
+        $sysmonWarnCount = 0
+
+        # Event ID 8 - CreateRemoteThread into protected targets
+        foreach ($evt in (Get-WinEvent -FilterHashtable @{ LogName='Microsoft-Windows-Sysmon/Operational'; Id=8; StartTime=$windowStart } -ErrorAction SilentlyContinue)) {
+            $src = Get-EventMessageField -Message $evt.Message -Name 'SourceImage'
+            $tgt = Get-EventMessageField -Message $evt.Message -Name 'TargetImage'
+            if (Test-ProtectedTarget $tgt) {
+                $log.Add("FAIL: Sysmon EID 8 remote thread into protected target -> Source: $src | Target: $tgt | Time: $($evt.TimeCreated)")
+                $flags++; $sysmonFailCount++
+            }
+        }
+
+        # Event ID 7 - suspicious image loads into protected targets
+        foreach ($evt in (Get-WinEvent -FilterHashtable @{ LogName='Microsoft-Windows-Sysmon/Operational'; Id=7; StartTime=$windowStart } -ErrorAction SilentlyContinue | Select-Object -First 4000)) {
+            $proc = Get-EventMessageField -Message $evt.Message -Name 'Image'
+            $img  = Get-EventMessageField -Message $evt.Message -Name 'ImageLoaded'
+            if (-not (Test-ProtectedTarget $proc)) { continue }
+            if ([string]::IsNullOrWhiteSpace($img)) { continue }
+            $sigInfo = Get-FileSignatureInfo -Path $img
+            if ((Test-UserWritablePath $img) -and (-not $sigInfo.Allowed)) {
+                $log.Add("FAIL: Sysmon EID 7 suspicious module in protected target -> Proc: $proc | Module: $img | Sig: $($sigInfo.Status) | Signer: $($sigInfo.Signer)")
+                $flags++; $sysmonFailCount++
+            }
+        }
+
+        # Event ID 10 - suspicious process access into protected targets
+        foreach ($evt in (Get-WinEvent -FilterHashtable @{ LogName='Microsoft-Windows-Sysmon/Operational'; Id=10; StartTime=$windowStart } -ErrorAction SilentlyContinue | Select-Object -First 3000)) {
+            $src = Get-EventMessageField -Message $evt.Message -Name 'SourceImage'
+            $tgt = Get-EventMessageField -Message $evt.Message -Name 'TargetImage'
+            if (-not (Test-ProtectedTarget $tgt)) { continue }
+            $srcSig = Get-FileSignatureInfo -Path $src
+            if ((Test-UserWritablePath $src) -or (-not $srcSig.Allowed) -or (Test-SuspiciousIndicator $src -BlacklistOnly)) {
+                $log.Add("WARN: Sysmon EID 10 suspicious process access into protected target -> Source: $src | Target: $tgt | Sig: $($srcSig.Status)")
+                $flags++; $sysmonWarnCount++
+            }
+        }
+
+        # Event ID 6 - driver loads
+        foreach ($evt in (Get-WinEvent -FilterHashtable @{ LogName='Microsoft-Windows-Sysmon/Operational'; Id=6; StartTime=$windowStart } -ErrorAction SilentlyContinue | Select-Object -First 1500)) {
+            $drv = Get-EventMessageField -Message $evt.Message -Name 'ImageLoaded'
+            if ([string]::IsNullOrWhiteSpace($drv)) { continue }
+            $sigInfo = Get-FileSignatureInfo -Path $drv
+            if ((-not $sigInfo.Allowed) -and ((Test-UserWritablePath $drv) -or $sigInfo.Status -ne 'Valid')) {
+                $log.Add("FAIL: Sysmon EID 6 suspicious driver load -> Driver: $drv | Sig: $($sigInfo.Status) | Signer: $($sigInfo.Signer)")
+                $flags++; $sysmonFailCount++
+            }
+        }
+
+        if ($sysmonFailCount -eq 0 -and $sysmonWarnCount -eq 0) {
+            $log.Add('PASS: No high-signal Sysmon injection or driver telemetry matched the protected-target rules.')
+        }
+    } else {
+        $log.Add('INFO: Sysmon operational log not present — high-signal telemetry checks downgraded to artifact-only.')
+    }
+} catch { $log.Add("INFO: High-signal telemetry correlation skipped — $($_.Exception.Message)") }
+
+# ==============================================================================
+#   SECTION: HIGH-SIGNAL PERSISTENCE & TAMPER CHECKS
+# ==============================================================================
+$log.Add("`n[SECTION: HIGH-SIGNAL PERSISTENCE & TAMPER CHECKS]")
+try {
+    $persistenceHits = 0
+
+    foreach ($rk in @('HKCU:\Software\Microsoft\Windows\CurrentVersion\Run','HKLM:\Software\Microsoft\Windows\CurrentVersion\Run')) {
+        try {
+            $item = Get-ItemProperty -Path $rk -ErrorAction SilentlyContinue
+            if (-not $item) { continue }
+            foreach ($prop in $item.PSObject.Properties | Where-Object { $_.Name -notmatch '^PS' }) {
+                $val = [string]$prop.Value
+                if ((Test-UserWritablePath $val) -or $val -match 'powershell(\.exe)?\s+.*(-enc|-encodedcommand)' -or (Test-SuspiciousIndicator $val -BlacklistOnly)) {
+                    $log.Add("FAIL: Suspicious Run key persistence -> $rk | $($prop.Name) | $val")
+                    $flags++; $persistenceHits++
+                }
+            }
+        } catch {}
+    }
+
+    try {
+        foreach ($task in (Get-ScheduledTask -ErrorAction SilentlyContinue)) {
+            foreach ($act in @($task.Actions)) {
+                if ($null -eq $act) { continue }
+                $cmd = (([string]$act.Execute) + ' ' + ([string]$act.Arguments)).Trim()
+                if ([string]::IsNullOrWhiteSpace($cmd)) { continue }
+                if ((Test-UserWritablePath $cmd) -or $cmd -match 'powershell(\.exe)?\s+.*(-enc|-encodedcommand)' -or (Test-SuspiciousIndicator $cmd -BlacklistOnly)) {
+                    $log.Add("FAIL: Suspicious scheduled task action -> $($task.TaskName) | $cmd")
+                    $flags++; $persistenceHits++
+                }
+            }
+        }
+    } catch { $log.Add('INFO: Scheduled task deep scan skipped.') }
+
+    try {
+        foreach ($consumer in (Get-CimInstance -Namespace root\subscription -Class CommandLineEventConsumer -ErrorAction SilentlyContinue)) {
+            $cmd = [string]$consumer.CommandLineTemplate
+            if ([string]::IsNullOrWhiteSpace($cmd)) { continue }
+            if ((Test-UserWritablePath $cmd) -or (Test-SuspiciousIndicator $cmd -BlacklistOnly) -or $cmd -match 'powershell(\.exe)?\s+.*(-enc|-encodedcommand)') {
+                $log.Add("FAIL: Suspicious WMI permanent consumer -> $($consumer.Name) | $cmd")
+                $flags++; $persistenceHits++
+            } else {
+                $log.Add("WARN: WMI permanent consumer present -> $($consumer.Name) | $cmd")
+            }
+        }
+    } catch { $log.Add('INFO: WMI permanent consumer scan skipped.') }
+
+    try {
+        $appInitKey = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows'
+        if (Test-Path $appInitKey) {
+            $appInit = Get-ItemProperty -Path $appInitKey -ErrorAction SilentlyContinue
+            if ($appInit -and $appInit.LoadAppInit_DLLs -eq 1 -and -not [string]::IsNullOrWhiteSpace([string]$appInit.AppInit_DLLs)) {
+                $log.Add("FAIL: AppInit_DLLs configured -> $([string]$appInit.AppInit_DLLs)")
+                $flags++; $persistenceHits++
+            }
+        }
+    } catch { $log.Add('INFO: AppInit_DLLs check skipped.') }
+
+    if ($persistenceHits -eq 0) {
+        $log.Add('PASS: No high-signal persistence mechanisms matched the stricter rules.')
+    }
+} catch { $log.Add("INFO: High-signal persistence checks skipped — $($_.Exception.Message)") }
+
+# ==============================================================================
+#   SECTION: EVENT LOG / POWERSHELL PROFILE TAMPER
+# ==============================================================================
+$log.Add("`n[SECTION: EVENT LOG / POWERSHELL PROFILE TAMPER]")
+try {
+    $tamperHits = 0
+    foreach ($evt in (Get-WinEvent -FilterHashtable @{ LogName='Security'; Id=1102; StartTime=(Get-Date).AddDays(-14) } -MaxEvents 10 -ErrorAction SilentlyContinue)) {
+        $log.Add("FAIL: Security event log cleared (Event ID 1102) -> $($evt.TimeCreated)")
+        $flags++; $tamperHits++
+    }
+
+    $profilePaths = @($PROFILE.AllUsersAllHosts, $PROFILE.AllUsersCurrentHost, $PROFILE.CurrentUserAllHosts, $PROFILE.CurrentUserCurrentHost) | Where-Object { $_ }
+    foreach ($profilePath in $profilePaths) {
+        try {
+            if (-not (Test-Path $profilePath)) { continue }
+            $content = Get-Content -Path $profilePath -Raw -ErrorAction SilentlyContinue
+            if ($content -match 'Add-MpPreference|Set-MpPreference|FromBase64String|EncodedCommand|wevtutil\s+cl|fsutil\s+usn\s+deletejournal') {
+                $log.Add("FAIL: Suspicious PowerShell profile content -> $profilePath")
+                $flags++; $tamperHits++
+            }
+        } catch {}
+    }
+
+    if ($tamperHits -eq 0) { $log.Add('PASS: No cleared security-log events or suspicious PowerShell profiles detected.') }
+} catch { $log.Add("INFO: Event log / PowerShell profile tamper checks skipped — $($_.Exception.Message)") }
+
 Update-ScanProgress -Percent 100
 $log.Add("Scan Completed: $(Get-Date)")
 
 $finalLog = Compress-LogLines -Lines $log
 $finalLog | Out-File -FilePath $logPath -Encoding UTF8
+
+Show-PAHWindow
 
 $webhookResult, $webhookMsg = Send-AuditWebhook `
     -Url         $webhookUrl `
@@ -2769,9 +3179,9 @@ $webhookResult, $webhookMsg = Send-AuditWebhook `
     -UserName    $env:USERNAME
 
 if ($webhookResult) {
-    Write-Host "Webhook sent." -ForegroundColor Green
+    Write-Host "✅ Webhook sent." -ForegroundColor Green
 } else {
-    Write-Host "Webhook dispatch failed: $webhookMsg" -ForegroundColor Red
+    Write-Host "❌ Webhook dispatch failed: $webhookMsg" -ForegroundColor Red
 }
 
 Write-Host ""
@@ -2796,9 +3206,9 @@ $madeBy = @"
 ██║ ╚═╝ ██║██║  ██║██████╔╝███████╗    ██████╔╝   ██║       ███████║╚██████╔╝██████╔╝███████╗   ██║   ███████╗   ██║   
 ╚═╝     ╚═╝╚═╝  ╚═╝╚═════╝ ╚══════╝    ╚═════╝    ╚═╝       ╚══════╝ ╚═════╝ ╚═════╝ ╚══════╝   ╚═╝   ╚══════╝   ╚═╝   
 
-PAH (Process Activity History) opens in a separate window for review during the scan.
+PAH (Process Activity History) should appear near the end of the scan.
 "@
 Write-Host $madeBy -ForegroundColor Red
-Write-Host "                                         - Sub's Recording Policy v5.0" -ForegroundColor White
+Write-Host "                                         - Sub's Recording Policy " -ForegroundColor White
 Write-Host "`n"
 
